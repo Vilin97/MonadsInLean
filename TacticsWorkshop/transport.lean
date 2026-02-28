@@ -50,14 +50,16 @@ def findSourceInst (goal : MVarId) (α β : Expr) : MetaM (Option FVarId) := do
       if declName != goalName then continue
       let declArgs := declType.getAppArgs
       if declArgs.size != goalArgs.size then continue
-      let mut isMatch := true
-      for i in [:goalArgs.size] do
-        let gArg := goalArgs[i]!
-        let dArg := declArgs[i]!
-        if ← isDefEq gArg dArg then continue
-        if (← isDefEq gArg β) && (← isDefEq dArg α) then continue
-        isMatch := false
-        break
+      let isMatch ← withoutModifyingState do
+        let mut ok := true
+        for i in [:goalArgs.size] do
+          let gArg := goalArgs[i]!
+          let dArg := declArgs[i]!
+          if ← isDefEq gArg dArg then continue
+          if (← isDefEq gArg β) && (← isDefEq dArg α) then continue
+          ok := false
+          break
+        return ok
       if isMatch then
         return some decl.fvarId
     return none
@@ -89,9 +91,9 @@ partial def buildTransportTerm (goalType : Expr) (equivExpr sourceExpr α β : E
     else
       pure sourceExpr
 
-/-- The main transport logic: project each field from the source instance,
+/-- Transport a structure: project each field from the source instance,
     transport it through the equivalence, and rebuild the structure. -/
-def transportCore (goal : MVarId) (equivExpr sourceInst α β : Expr)
+def transportStructure (goal : MVarId) (equivExpr sourceInst α β : Expr)
     : TacticM Unit := do
   goal.withContext do
     let goalType ← goal.getType
@@ -101,7 +103,6 @@ def transportCore (goal : MVarId) (equivExpr sourceInst α β : Expr)
     if !isStructure env goalName then
       throwError "transport: {goalName} is not a structure"
     let fields := getStructureFieldsFlattened env goalName (includeSubobjectFields := false)
-    -- Build each transported field
     let mut transportedFields : Array Expr := #[]
     let mut unsolved : List MVarId := []
     for field in fields do
@@ -109,18 +110,14 @@ def transportCore (goal : MVarId) (equivExpr sourceInst α β : Expr)
       let sourceFieldType ← inferType sourceField
       let fieldGoalType := sourceFieldType.replace fun e =>
         if e == α then some β else none
-      -- Try to build the transported term
       try
         let transported ← buildTransportTerm fieldGoalType equivExpr sourceField α β
-        -- Type-check the result
         let _ ← inferType transported
         transportedFields := transportedFields.push transported
       catch _ =>
-        -- If automatic transport fails, create a metavar for the user to fill
         let mvar ← mkFreshExprMVar fieldGoalType
         transportedFields := transportedFields.push mvar
         unsolved := unsolved ++ [mvar.mvarId!]
-    -- Use constructor to decompose, then assign each field
     let subgoals ← goal.constructor
     for (sg, field) in subgoals.zip transportedFields.toList do
       try
@@ -129,33 +126,169 @@ def transportCore (goal : MVarId) (equivExpr sourceInst α β : Expr)
         unsolved := unsolved ++ [sg]
     replaceMainGoal unsolved
 
+/-- Search the local context for a hypothesis from which `buildTransportTerm`
+    can produce a proof of the goal. -/
+def findSourceHyp (goal : MVarId) (equivExpr α β : Expr) : MetaM (Option FVarId) := do
+  goal.withContext do
+    let goalType ← goal.getType
+    let lctx ← getLCtx
+    for decl in lctx do
+      if decl.isAuxDecl then continue
+      try
+        let result ← withoutModifyingState do
+          let r ← buildTransportTerm goalType equivExpr decl.toExpr α β
+          let rType ← inferType r
+          if ← isDefEq rType goalType then return some r
+          return none
+        if result.isSome then return some decl.fvarId
+      catch _ => continue
+    return none
+
+/-- Transport a Prop by finding a source hypothesis and building the proof
+    via `buildTransportTerm`. -/
+def transportProp (goal : MVarId) (equivExpr α β : Expr) : TacticM Unit := do
+  goal.withContext do
+    let goalType ← goal.getType
+    match ← findSourceHyp goal equivExpr α β with
+    | some srcFVarId =>
+      let sourceExpr := Expr.fvar srcFVarId
+      let result ← buildTransportTerm goalType equivExpr sourceExpr α β
+      goal.assign result
+      replaceMainGoal []
+    | none =>
+      throwError "transport: could not find a source hypothesis to transport"
+
+/-- Transport an inductive type: use `cases` on the source to extract fields,
+    then `constructor` on the goal and transport each field. -/
+def transportInductive (goal : MVarId) (equivExpr : Expr) (srcFVarId : FVarId)
+    (α β : Expr) : TacticM Unit := do
+  -- Case-split the source hypothesis to extract its fields
+  let casesResult ← goal.cases srcFVarId
+  let mut remaining : List MVarId := []
+  for alt in casesResult do
+    let sg := alt.mvarId
+    -- After cases, the subgoal has the constructor fields in context.
+    -- Use constructor on the goal, then try to transport each field.
+    let subgoals ← sg.constructor
+    for fieldGoal in subgoals do
+      let closed ← fieldGoal.withContext do
+        let fgType ← fieldGoal.getType
+        -- Search the local context for a transportable source
+        let lctx ← getLCtx
+        for decl in lctx do
+          if decl.isAuxDecl then continue
+          try
+            let result ← buildTransportTerm fgType equivExpr decl.toExpr α β
+            let rType ← inferType result
+            if ← isDefEq rType fgType then
+              fieldGoal.assign result
+              return true
+          catch _ => continue
+        return false
+      if !closed then
+        remaining := remaining ++ [fieldGoal]
+  replaceMainGoal remaining
+
+/-- Main entry point: dispatch to structure, inductive, or Prop transport. -/
+def transportCore (goal : MVarId) (equivExpr α β : Expr) : TacticM Unit := do
+  goal.withContext do
+    let goalType ← goal.getType
+    let env ← getEnv
+    let isStruct := match goalType.getAppFn.constName? with
+      | some name => isStructure env name
+      | none => false
+    -- Try structure transport first
+    if isStruct then
+      match ← findSourceInst goal α β with
+      | some srcFVarId =>
+        transportStructure goal equivExpr (.fvar srcFVarId) α β
+        return
+      | none => pure ()
+    -- Try Prop transport (∀-quantified statements)
+    if ← isProp goalType then
+      -- First try direct buildTransportTerm
+      match ← findSourceHyp goal equivExpr α β with
+      | some srcFVarId =>
+        let sourceExpr := Expr.fvar srcFVarId
+        let result ← buildTransportTerm goalType equivExpr sourceExpr α β
+        goal.assign result
+        replaceMainGoal []
+        return
+      | none => pure ()
+    -- Try direct term building (functions, plain types, etc.)
+    match ← findSourceHyp goal equivExpr α β with
+    | some srcFVarId =>
+      let sourceExpr := Expr.fvar srcFVarId
+      let result ← buildTransportTerm goalType equivExpr sourceExpr α β
+      goal.assign result
+      replaceMainGoal []
+      return
+    | none => pure ()
+    -- Try inductive transport (e.g. Nonempty, Exists)
+    match ← findSourceInst goal α β with
+    | some srcFVarId =>
+      transportInductive goal equivExpr srcFVarId α β
+    | none =>
+      throwError "transport: could not find a matching source for {goalType}"
+
 end Transport
 
 open Transport in
-/-- `transport using e` transports a structure instance along an equivalence `e : α ≃ β`.
+/-- `transport using e` transports a structure instance or theorem along an
+equivalence `e : α ≃ β`.
 
-It searches the local context for a matching source instance on `α` and decomposes
-the goal structure, attempting to fill each field by composing through `e`.
+- **Structure goals** (`S β`): finds a source instance `S α` in the context,
+  projects each field, rewrites through `e`, and rebuilds the structure.
+- **Prop goals** (`∀ x : β, P x`): finds a source hypothesis about `α` and
+  builds a proof by converting `β`-quantified variables via `e.symm`.
+- **Inductive goals** (`Nonempty β` etc.): case-splits the source and
+  reconstructs via the constructor.
 
-Any fields that cannot be closed automatically are left as subgoals. -/
+Any fields/goals that cannot be closed automatically are left as subgoals. -/
 elab "transport" " using " e:term : tactic => do
   let goal ← getMainGoal
   let equivExpr ← Tactic.elabTerm e none
   let (α, β) ← getEquivTypes equivExpr
-  match ← findSourceInst goal α β with
-  | some srcFVarId =>
-    let sourceInst := .fvar srcFVarId
-    transportCore goal equivExpr sourceInst α β
-  | none =>
-    throwError "transport: could not find a source instance on the type {α}"
+  transportCore goal equivExpr α β
 
 -- ============================================================
 -- Examples
 -- ============================================================
 
--- Example 1: A simple custom structure with one operation
+-- Example 1: Transport a structure
 structure MyMul (α : Type*) where
   mul : α → α → α
 
 example {α β : Type*} (inst : MyMul α) (e : α ≃ β) : MyMul β := by
+  transport using e
+
+-- Example 2: Transport a universally quantified proposition
+example {α β : Type*} (e : α ≃ β) (P : α → Prop) (h : ∀ x : α, P x)
+    : ∀ x : β, P (e.symm x) := by
+  transport using e
+
+-- Example 3: Transport a binary predicate
+example {α β : Type*} (e : α ≃ β) (R : α → α → Prop) (h : ∀ x y : α, R x y)
+    : ∀ x y : β, R (e.symm x) (e.symm y) := by
+  transport using e
+
+-- Example 4: Transport Nonempty
+example {α β : Type*} (h : Nonempty α) (e : α ≃ β) : Nonempty β := by
+  transport using e
+
+-- Example 5: Transport a proposition about a function
+example {α β : Type*} (e : α ≃ β) (f : α → α) (h : ∀ x : α, f x = x)
+    : ∀ x : β, f (e.symm x) = e.symm x := by
+  transport using e
+
+-- Example 6: Transport a function α → α to β → β
+example {α β : Type*} (f : α → α) (e : α ≃ β) : β → β := by
+  transport using e
+
+-- Example 7: Transport a binary operation α → α → α to β → β → β
+example {α β : Type*} (op : α → α → α) (e : α ≃ β) : β → β → β := by
+  transport using e
+
+-- Example 8: Transport an element α to β
+example {α β : Type*} (a : α) (e : α ≃ β) : β := by
   transport using e
