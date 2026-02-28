@@ -91,40 +91,123 @@ partial def buildTransportTerm (goalType : Expr) (equivExpr sourceExpr α β : E
     else
       pure sourceExpr
 
-/-- Transport a structure: project each field from the source instance,
-    transport it through the equivalence, and rebuild the structure. -/
+/-- Build a simp context with Equiv cancellation lemmas:
+    `Equiv.symm_apply_apply`, `Equiv.apply_symm_apply`,
+    `EmbeddingLike.apply_eq_iff_eq`. -/
+def mkTransportSimpCtx : MetaM (Simp.Context × Simp.SimprocsArray) := do
+  let mut simpTheorems : SimpTheorems := {}
+  -- Normalize toFun/invFun to coercions
+  simpTheorems ← simpTheorems.addConst ``Equiv.toFun_as_coe
+  simpTheorems ← simpTheorems.addConst ``Equiv.invFun_as_coe
+  -- Cancel e.symm (e x) and e (e.symm x)
+  simpTheorems ← simpTheorems.addConst ``Equiv.symm_apply_apply
+  simpTheorems ← simpTheorems.addConst ``Equiv.apply_symm_apply
+  -- Reduce e x = e y to x = y
+  simpTheorems ← simpTheorems.addConst ``EmbeddingLike.apply_eq_iff_eq
+  let ctx ← Simp.mkContext (simpTheorems := #[simpTheorems])
+  return (ctx, #[])
+
+/-- Try to close all Prop subgoals at once by:
+    1. `dsimp` + `simp` with Equiv lemmas + all source Prop fields (axioms)
+    2. `intro` + `refl`/`apply` to close any remaining goals -/
+def closeAxiomGoals (goals : List MVarId) (sourceAxioms : Array Expr)
+    : MetaM (List MVarId) := do
+  -- Build simp context with Equiv lemmas + all source axioms
+  let (baseSimpCtx, _) ← mkTransportSimpCtx
+  let mut simpTheorems := baseSimpCtx.simpTheorems[0]!
+  for h : idx in [:sourceAxioms.size] do
+    let axiom_ := sourceAxioms[idx]
+    try
+      let origin := match axiom_ with
+        | .fvar fvarId => Origin.fvar fvarId
+        | _ => Origin.other (Name.mkNum `transport_axiom idx)
+      simpTheorems ← simpTheorems.add origin #[] axiom_
+    catch _ => pure ()
+  let ctx ← Simp.mkContext (simpTheorems := #[simpTheorems])
+  let mut unsolved : List MVarId := []
+  for sg in goals do
+    if ← sg.isAssigned then continue
+    -- Try dsimp first (beta reduction)
+    let sg ← do
+      try
+        let (some sg, _) ← dsimpGoal sg ctx | pure sg
+        pure sg
+      catch _ => pure sg
+    if ← sg.isAssigned then continue
+    -- Try simp
+    let simpResult ← do
+      try
+        match ← simpGoal sg ctx with
+        | (none, _) => pure none  -- simp closed it
+        | (some (_, g), _) => pure (some g)
+      catch _ => pure (some sg)
+    match simpResult with
+    | none => continue  -- closed by simp
+    | some sg =>
+      -- Try intro + refl/apply
+      let (_, sg) ← sg.intros
+      let closed ← sg.withContext do
+        try sg.refl; return true catch _ => pure ()
+        -- Try each source axiom via apply
+        for axiom_ in sourceAxioms do
+          try
+            let subs ← sg.apply axiom_
+            let allDone ← subs.allM fun s => do
+              try s.refl; return true catch _ =>
+              try discard <| s.assumption; return true catch _ =>
+              return false
+            if allDone then return true
+          catch _ => continue
+        return false
+      if !closed then
+        unsolved := unsolved ++ [sg]
+  return unsolved
+
+/-- Transport a structure: use `constructor` to decompose the goal, then
+    for each subgoal either build the transported data field or close the
+    axiom (Prop) field via `simp` with Equiv lemmas + the source axiom. -/
 def transportStructure (goal : MVarId) (equivExpr sourceInst α β : Expr)
     : TacticM Unit := do
   goal.withContext do
     let goalType ← goal.getType
     let goalHead := goalType.getAppFn
-    let some goalName := goalHead.constName? | throwError "transport: goal is not a structure"
+    let some goalName := goalHead.constName?
+      | throwError "transport: goal is not a structure"
     let env ← getEnv
     if !isStructure env goalName then
       throwError "transport: {goalName} is not a structure"
-    let fields := getStructureFieldsFlattened env goalName (includeSubobjectFields := false)
-    let mut transportedFields : Array Expr := #[]
+    let fields := getStructureFieldsFlattened env goalName
+      (includeSubobjectFields := false)
+    let subgoals ← goal.constructor
+    -- First pass: close data (non-Prop) subgoals
     let mut unsolved : List MVarId := []
+    for sg in subgoals do
+      let sgType ← sg.getType
+      if ← isProp sgType then
+        unsolved := unsolved ++ [sg]
+        continue
+      let closed ← sg.withContext do
+        for field in fields do
+          let sourceField ← mkProjection sourceInst field
+          try
+            let transported ← buildTransportTerm sgType equivExpr
+              sourceField α β
+            sg.assign transported
+            return true
+          catch _ => continue
+        return false
+      if !closed then
+        unsolved := unsolved ++ [sg]
+    -- Collect all source Prop fields (axioms)
+    let mut sourceAxioms : Array Expr := #[]
     for field in fields do
       let sourceField ← mkProjection sourceInst field
-      let sourceFieldType ← inferType sourceField
-      let fieldGoalType := sourceFieldType.replace fun e =>
-        if e == α then some β else none
-      try
-        let transported ← buildTransportTerm fieldGoalType equivExpr sourceField α β
-        let _ ← inferType transported
-        transportedFields := transportedFields.push transported
-      catch _ =>
-        let mvar ← mkFreshExprMVar fieldGoalType
-        transportedFields := transportedFields.push mvar
-        unsolved := unsolved ++ [mvar.mvarId!]
-    let subgoals ← goal.constructor
-    for (sg, field) in subgoals.zip transportedFields.toList do
-      try
-        sg.assign field
-      catch _ =>
-        unsolved := unsolved ++ [sg]
-    replaceMainGoal unsolved
+      let sfType ← inferType sourceField
+      if ← isProp sfType then
+        sourceAxioms := sourceAxioms.push sourceField
+    -- Second pass: close Prop (axiom) subgoals via dsimp + simp + apply
+    let stillUnsolved ← closeAxiomGoals unsolved sourceAxioms
+    replaceMainGoal stillUnsolved
 
 /-- Search the local context for a hypothesis from which `buildTransportTerm`
     can produce a proof of the goal. -/
@@ -267,6 +350,11 @@ example {α β : Type*} (e : α ≃ β) (P : α → Prop) (h : ∀ x : α, P x)
     : ∀ x : β, P (e.symm x) := by
   transport using e
 
+-- Example 2b: P is polymorphic over another type parameter
+example {α β γ : Type*} (e : α ≃ β) (P : γ → α → Prop) (h : ∀ c x, P c x)
+    : ∀ c (x : β), P c (e.symm x) := by
+  transport using e
+
 -- Example 3: Transport a binary predicate
 example {α β : Type*} (e : α ≃ β) (R : α → α → Prop) (h : ∀ x y : α, R x y)
     : ∀ x y : β, R (e.symm x) (e.symm y) := by
@@ -291,4 +379,23 @@ example {α β : Type*} (op : α → α → α) (e : α ≃ β) : β → β → 
 
 -- Example 8: Transport an element α to β
 example {α β : Type*} (a : α) (e : α ≃ β) : β := by
+  transport using e
+
+-- Example 9: Transport a semigroup (structure with data + axiom fields)
+structure MySemigroup (α : Type*) where
+  mul : α → α → α
+  mul_assoc : ∀ x y z : α, mul (mul x y) z = mul x (mul y z)
+
+example {α β : Type*} (s : MySemigroup α) (e : α ≃ β) : MySemigroup β := by
+  transport using e
+
+-- Example 10: Transport a monoid (multiple data + axiom fields)
+structure MyMonoid (α : Type*) where
+  mul : α → α → α
+  one : α
+  mul_assoc : ∀ x y z : α, mul (mul x y) z = mul x (mul y z)
+  one_mul : ∀ x : α, mul one x = x
+  mul_one : ∀ x : α, mul x one = x
+
+example {α β : Type*} (m : MyMonoid α) (e : α ≃ β) : MyMonoid β := by
   transport using e
